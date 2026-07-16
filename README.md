@@ -40,7 +40,7 @@ Agent harnesses rot quietly: a hook script gets moved and dies silently, a skill
 As a skill (Claude Code, Codex, or any agent that reads `skills/`):
 
 ```bash
-npx skills add <your-gh-user>/harness-radar
+npx skills add sants2001/harness-radar
 ```
 
 Or standalone, no install:
