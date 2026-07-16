@@ -15,7 +15,7 @@ const os = require('os');
 const HOME = os.homedir();
 const CLAUDE = path.join(HOME, '.claude');
 const CODEX = process.env.CODEX_HOME || path.join(HOME, '.codex');
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 
 const args = process.argv.slice(2);
 function flag(name, dflt) {
@@ -37,9 +37,16 @@ const isBrokenLink = p => {
   try { return fs.lstatSync(p).isSymbolicLink() && !exists(p); } catch { return false; }
 };
 
-function check(name, pass, fix, file, detail) {
-  return { name, pass: !!pass, fix, file, detail };
+// `how` is a mechanical remediation recipe: either a shell command
+// (starts with "$ ") or "paste into <file>:\n<snippet>". Recipes are written
+// so the weakest agent (or a human) can apply them verbatim, no judgment.
+function check(name, pass, fix, file, detail, how) {
+  return { name, pass: !!pass, fix, file, detail, how };
 }
+
+// Order fixes by blast radius so partial effort lands where it matters.
+const FIX_PRIORITY = ['Security', 'Hooks', 'Instructions', 'Cost & Context', 'Model Routing', 'Config', 'Memory', 'Evals', 'Skills', 'Extensions'];
+const prio = cat => { const i = FIX_PRIORITY.indexOf(cat); return i < 0 ? 99 : i; };
 
 // Extract every hook command string from a Claude-style hooks object
 function hookCommands(hooksObj) {
@@ -80,60 +87,86 @@ function auditClaude() {
 
   const mdBytes = sizeOf(path.join(HOME, 'CLAUDE.md')) + sizeOf(path.join(CLAUDE, 'CLAUDE.md'));
   cats['Instructions'] = [
-    check('CLAUDE.md present', userMd.length > 0, 'Create ~/CLAUDE.md with your working rules', '~/CLAUDE.md'),
-    check('Instruction budget sane (<64KB total)', mdBytes > 0 && mdBytes < 65536, 'Split detail into read-on-demand refs; keep the always-loaded file lean', '~/CLAUDE.md', `${(mdBytes / 1024).toFixed(1)}KB`),
-    check('Read-on-demand split referenced', /refs\/|read on demand|read when/i.test(userMd), 'Point CLAUDE.md at split reference files instead of inlining everything', '~/CLAUDE.md'),
+    check('CLAUDE.md present', userMd.length > 0, 'Create ~/CLAUDE.md with your working rules', '~/CLAUDE.md',
+      undefined, 'paste into ~/CLAUDE.md:\n# Working rules\n- Lead with the answer; no preambles or recaps.\n- Verify before finishing: run build/tests, do not declare done on reasoning alone.\n- Never invent a function, file, or fact; "I do not know" is a valid answer.'),
+    check('Instruction budget sane (<64KB total)', mdBytes > 0 && mdBytes < 65536, 'Split detail into read-on-demand refs; keep the always-loaded file lean', '~/CLAUDE.md', `${(mdBytes / 1024).toFixed(1)}KB`,
+      'Move each long section into ~/.claude/refs/<topic>.md, then replace it in CLAUDE.md with one table row: | ~/.claude/refs/<topic>.md | Read when <situation> |'),
+    check('Read-on-demand split referenced', /refs\/|read on demand|read when/i.test(userMd), 'Point CLAUDE.md at split reference files instead of inlining everything', '~/CLAUDE.md',
+      undefined, 'paste into ~/CLAUDE.md:\n## Reference Files (read on demand)\n| File | Read when |\n|---|---|\n| ~/.claude/refs/<topic>.md | <situation> |'),
   ];
 
   const sk = auditSkillsDir(path.join(CLAUDE, 'skills'));
   cats['Skills'] = [
-    check('Skills installed', sk.count > 0, 'Install skills into ~/.claude/skills', '~/.claude/skills', `${sk.count} skills`),
-    check('No broken skill symlinks', sk.broken.length === 0, `Remove or repoint: ${sk.broken.slice(0, 3).join(', ')}`, '~/.claude/skills', `${sk.broken.length} broken`),
-    check('Skills have SKILL.md (sampled)', sk.missingManifest.length === 0, `Add SKILL.md to: ${sk.missingManifest.slice(0, 3).join(', ')}`, '~/.claude/skills'),
+    check('Skills installed', sk.count > 0, 'Install skills into ~/.claude/skills', '~/.claude/skills', `${sk.count} skills`,
+      '$ npx skills add anthropics/skills'),
+    check('No broken skill symlinks', sk.broken.length === 0, `Remove or repoint: ${sk.broken.slice(0, 3).join(', ')}`, '~/.claude/skills', `${sk.broken.length} broken`,
+      '$ find ~/.claude/skills -maxdepth 1 -type l ! -exec test -e {} \\; -print -delete'),
+    check('Skills have SKILL.md (sampled)', sk.missingManifest.length === 0, `Add SKILL.md to: ${sk.missingManifest.slice(0, 3).join(', ')}`, '~/.claude/skills',
+      undefined, 'paste into <skill-dir>/SKILL.md:\n---\nname: <dir-name>\ndescription: <one line: what it does and when to use it>\n---'),
   ];
 
   const deadHooks = hooks.map(h => scriptPathOf(h.command)).filter(p => p && !exists(p));
   cats['Hooks'] = [
-    check('Hooks configured', hooks.length > 0, 'Wire hooks in ~/.claude/settings.json', '~/.claude/settings.json', `${hooks.length} hooks`),
-    check('All hook scripts exist', deadHooks.length === 0, `Fix dead hook paths: ${deadHooks.slice(0, 2).join(', ')}`, '~/.claude/settings.json', `${deadHooks.length} dead`),
-    check('Every hook has a timeout', hooks.every(h => typeof h.timeout === 'number'), 'Add "timeout" to each hook so one hang cannot stall turns', '~/.claude/settings.json'),
-    check('Slow hooks are async', hooks.filter(h => (h.timeout || 0) >= 15).every(h => h.async === true), 'Mark hooks with timeout >=15s as "async": true', '~/.claude/settings.json'),
+    check('Hooks configured', hooks.length > 0, 'Wire hooks in ~/.claude/settings.json', '~/.claude/settings.json', `${hooks.length} hooks`,
+      'paste into ~/.claude/settings.json:\n"hooks": { "PostToolUse": [ { "matcher": "Edit|Write", "hooks": [ { "type": "command", "command": "<script>", "timeout": 10, "async": true } ] } ] }'),
+    check('All hook scripts exist', deadHooks.length === 0, `Fix dead hook paths: ${deadHooks.slice(0, 2).join(', ')}`, '~/.claude/settings.json', `${deadHooks.length} dead`,
+      'For each dead path: restore the script at that path, or delete its hook entry from settings.json. A dead hook fails silently on every matching tool call.'),
+    check('Every hook has a timeout', hooks.every(h => typeof h.timeout === 'number'), 'Add "timeout" to each hook so one hang cannot stall turns', '~/.claude/settings.json',
+      undefined, 'Add "timeout": 10 to every hook object missing one.'),
+    check('Slow hooks are async', hooks.filter(h => (h.timeout || 0) >= 15).every(h => h.async === true), 'Mark hooks with timeout >=15s as "async": true', '~/.claude/settings.json',
+      undefined, 'Add "async": true to every hook object whose timeout is 15 or higher.'),
   ];
 
   const deny = ((settings.permissions || {}).deny) || [];
   cats['Security'] = [
-    check('Permission deny list non-empty', deny.length > 0, 'Add a permissions.deny list', '~/.claude/settings.json', `${deny.length} rules`),
-    check('.env files denied', deny.some(d => /\.env/.test(d)), 'Deny Read(.env*) so secrets never enter context', '~/.claude/settings.json'),
-    check('curl|bash pipes denied', deny.some(d => /curl.*(\||bash|sh)/.test(d)), 'Deny curl-pipe-to-shell patterns', '~/.claude/settings.json'),
-    check('Security rules doc present', exists(path.join(CLAUDE, 'rules', 'common', 'security.md')) || exists(path.join(CLAUDE, 'refs', 'common', 'security.md')), 'Add a security rules file under rules/ or refs/', '~/.claude/rules/common/security.md'),
+    check('Permission deny list non-empty', deny.length > 0, 'Add a permissions.deny list', '~/.claude/settings.json', `${deny.length} rules`,
+      'paste into ~/.claude/settings.json:\n"permissions": { "deny": ["Read(.env)", "Read(.env.*)", "Read(**/*.pem)", "Bash(curl * | *sh)"] }'),
+    check('.env files denied', deny.some(d => /\.env/.test(d)), 'Deny Read(.env*) so secrets never enter context', '~/.claude/settings.json',
+      undefined, 'Add "Read(.env)" and "Read(.env.*)" to permissions.deny.'),
+    check('curl|bash pipes denied', deny.some(d => /curl.*(\||bash|sh)/.test(d)), 'Deny curl-pipe-to-shell patterns', '~/.claude/settings.json',
+      undefined, 'Add "Bash(curl * | *sh)" to permissions.deny.'),
+    check('Security rules doc present', exists(path.join(CLAUDE, 'rules', 'common', 'security.md')) || exists(path.join(CLAUDE, 'refs', 'common', 'security.md')), 'Add a security rules file under rules/ or refs/', '~/.claude/rules/common/security.md',
+      undefined, 'paste into ~/.claude/rules/common/security.md:\n# Security\n- Never hardcode secrets; env vars or a secret manager only.\n- Validate all user input at trust boundaries.\n- Parameterized queries only. Sanitize rendered HTML.\n- On any exposed secret: stop, rotate, then continue.'),
   ];
 
   const memDirs = listDir(path.join(CLAUDE, 'projects')).filter(d => exists(path.join(CLAUDE, 'projects', d, 'memory', 'MEMORY.md')));
   cats['Memory'] = [
-    check('Persistent memory in use', memDirs.length > 0 || /memory/i.test(userMd), 'Adopt a memory convention (MEMORY.md index + one fact per file)', '~/.claude/projects/*/memory/', `${memDirs.length} projects`),
-    check('Memory conventions documented', /memory/i.test(userMd), 'Document when to save/recall memory in CLAUDE.md', '~/CLAUDE.md'),
+    check('Persistent memory in use', memDirs.length > 0 || /memory/i.test(userMd), 'Adopt a memory convention (MEMORY.md index + one fact per file)', '~/.claude/projects/*/memory/', `${memDirs.length} projects`,
+      'Create memory/MEMORY.md per project: one pointer line per saved fact, facts in sibling files with name/description frontmatter.'),
+    check('Memory conventions documented', /memory/i.test(userMd), 'Document when to save/recall memory in CLAUDE.md', '~/CLAUDE.md',
+      undefined, 'paste into ~/CLAUDE.md:\n## Memory\nSave durable facts (preferences, project context, corrections) to memory files; never save what the repo already records.'),
   ];
 
   const routingDoc = ['rules/model-routing.md', 'refs/model-routing.md'].map(p => readText(path.join(CLAUDE, p))).join('');
   const tierCount = ['opus', 'sonnet', 'haiku', 'fable'].filter(t => routingDoc.toLowerCase().includes(t)).length;
+  const routingSnippet = 'paste into ~/.claude/refs/model-routing.md:\n# Model Routing\nMatch model tier to judgment depth, not output length.\n| Task | Model |\n|---|---|\n| Architecture, money, data shape, user trust | opus |\n| Production code (default) | sonnet |\n| Formatting, renames, mechanical edits | haiku |';
   cats['Model Routing'] = [
-    check('Routing doc present', routingDoc.length > 0, 'Write model-routing.md: match model tier to judgment depth', '~/.claude/refs/model-routing.md'),
-    check('Covers >=3 tiers', tierCount >= 3, 'Route across at least 3 tiers (frontier / default / cheap)', '~/.claude/refs/model-routing.md', `${tierCount} tiers`),
-    check('Routing wired into CLAUDE.md', /model routing|judgment-depth/i.test(userMd), 'Reference the routing rule from CLAUDE.md so it actually fires', '~/CLAUDE.md'),
+    check('Routing doc present', routingDoc.length > 0, 'Write model-routing.md: match model tier to judgment depth', '~/.claude/refs/model-routing.md',
+      undefined, routingSnippet),
+    check('Covers >=3 tiers', tierCount >= 3, 'Route across at least 3 tiers (frontier / default / cheap)', '~/.claude/refs/model-routing.md', `${tierCount} tiers`,
+      routingSnippet),
+    check('Routing wired into CLAUDE.md', /model routing|judgment-depth/i.test(userMd), 'Reference the routing rule from CLAUDE.md so it actually fires', '~/CLAUDE.md',
+      undefined, 'paste into ~/CLAUDE.md:\n## Model Routing\nJudgment-depth rule: frontier tier for architecture/money/trust, default tier for production code, cheap tier for mechanical edits. Full table: ~/.claude/refs/model-routing.md'),
   ];
 
   const env = settings.env || {};
   cats['Cost & Context'] = [
-    check('Thinking tokens capped', Number(env.MAX_THINKING_TOKENS) > 0, 'Set env.MAX_THINKING_TOKENS in settings.json', '~/.claude/settings.json', env.MAX_THINKING_TOKENS),
-    check('Output-discipline prompt hook', hooks.some(h => h.event === 'UserPromptSubmit' && /discipline|output/i.test(h.command)), 'Inject response-shape rules on UserPromptSubmit (lead with answer, no recaps)', '~/.claude/settings.json'),
-    check('Context guidance documented', /context|token/i.test(userMd), 'Document context budget habits in CLAUDE.md', '~/CLAUDE.md'),
+    check('Thinking tokens capped', Number(env.MAX_THINKING_TOKENS) > 0, 'Set env.MAX_THINKING_TOKENS in settings.json', '~/.claude/settings.json', env.MAX_THINKING_TOKENS,
+      'paste into ~/.claude/settings.json:\n"env": { "MAX_THINKING_TOKENS": "10000" }'),
+    check('Output-discipline prompt hook', hooks.some(h => h.event === 'UserPromptSubmit' && /discipline|output/i.test(h.command)), 'Inject response-shape rules on UserPromptSubmit (lead with answer, no recaps)', '~/.claude/settings.json',
+      undefined, 'Create a UserPromptSubmit hook script that prints {"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"Lead with the answer. No preambles, no trailing recaps."}} and wire it in settings.json hooks.UserPromptSubmit.'),
+    check('Context guidance documented', /context|token/i.test(userMd), 'Document context budget habits in CLAUDE.md', '~/CLAUDE.md',
+      undefined, 'paste into ~/CLAUDE.md:\n## Context\nKeep always-loaded instructions lean; push detail to read-on-demand refs. Prefer targeted reads over whole-file reads.'),
   ];
 
   const evals = path.join(CLAUDE, 'evals');
   cats['Evals'] = [
-    check('Evals directory', exists(evals), 'Create ~/.claude/evals with grade scripts', '~/.claude/evals'),
-    check('Baseline recorded', exists(path.join(evals, 'baseline.json')), 'Record a baseline.json to detect regressions', '~/.claude/evals/baseline.json'),
-    check('Grade scripts (>=2)', listDir(evals).filter(f => /^grade-.*\.(sh|js)$/.test(f)).length >= 2, 'Add grade-*.sh scripts for repeatable harness grading', '~/.claude/evals'),
+    check('Evals directory', exists(evals), 'Create ~/.claude/evals with grade scripts', '~/.claude/evals',
+      undefined, '$ mkdir -p ~/.claude/evals'),
+    check('Baseline recorded', exists(path.join(evals, 'baseline.json')), 'Record a baseline.json to detect regressions', '~/.claude/evals/baseline.json',
+      undefined, `$ node ${__filename} --format json > ~/.claude/evals/baseline.json`),
+    check('Grade scripts (>=2)', listDir(evals).filter(f => /^grade-.*\.(sh|js)$/.test(f)).length >= 2, 'Add grade-*.sh scripts for repeatable harness grading', '~/.claude/evals',
+      undefined, 'Write grade-<aspect>.sh scripts that exit non-zero on regression (e.g. diff current audit JSON against baseline.json).'),
   ];
 
   return cats;
@@ -163,36 +196,49 @@ function auditCodex() {
   const deadHooks = hooks.map(h => scriptPathOf(h.command)).filter(p => p && !exists(p));
   const trusted = (config.match(/^\[hooks\.state\."/gm) || []).length;
   cats['Hooks'] = [
-    check('Hooks feature enabled', /^\s*hooks\s*=\s*true/m.test(config), 'Set [features] hooks = true in config.toml', '~/.codex/config.toml'),
-    check('hooks.json valid', hooksJson !== null && hooks.length > 0, 'Create ~/.codex/hooks.json (Claude hook schema)', '~/.codex/hooks.json', `${hooks.length} hooks`),
-    check('All hook scripts exist', deadHooks.length === 0, `Fix dead hook paths: ${deadHooks.slice(0, 2).join(', ')}`, '~/.codex/hooks.json', `${deadHooks.length} dead`),
-    check('All hooks trusted', hooks.length > 0 && trusted >= hooks.length, 'Approve pending hook trust prompts (config.toml [hooks.state])', '~/.codex/config.toml', `${trusted}/${hooks.length} trusted`),
+    check('Hooks feature enabled', /^\s*hooks\s*=\s*true/m.test(config), 'Set [features] hooks = true in config.toml', '~/.codex/config.toml',
+      undefined, 'paste into ~/.codex/config.toml:\n[features]\nhooks = true'),
+    check('hooks.json valid', hooksJson !== null && hooks.length > 0, 'Create ~/.codex/hooks.json (Claude hook schema)', '~/.codex/hooks.json', `${hooks.length} hooks`,
+      'paste into ~/.codex/hooks.json:\n{ "hooks": { "PostToolUse": [ { "matcher": "apply_patch|write", "hooks": [ { "type": "command", "command": "<script>", "timeout": 10, "async": true } ] } ] } }'),
+    check('All hook scripts exist', deadHooks.length === 0, `Fix dead hook paths: ${deadHooks.slice(0, 2).join(', ')}`, '~/.codex/hooks.json', `${deadHooks.length} dead`,
+      'For each dead path: restore the script at that path, or delete its hook entry from hooks.json.'),
+    check('All hooks trusted', hooks.length > 0 && trusted >= hooks.length, 'Approve pending hook trust prompts (config.toml [hooks.state])', '~/.codex/config.toml', `${trusted}/${hooks.length} trusted`,
+      'Start a Codex session and trigger each hook once (edit a file, send a prompt); approve every trust dialog. Untrusted hooks silently do nothing.'),
   ];
 
   cats['Security'] = [
-    check('Sandbox mode set', /^\s*sandbox_mode\s*=/m.test(config), 'Set sandbox_mode (workspace-write recommended)', '~/.codex/config.toml'),
-    check('Approvals not disabled', !/^\s*approval_policy\s*=\s*"never"/m.test(config), 'approval_policy = "never" removes the human gate; prefer "on-request"', '~/.codex/config.toml'),
-    check('Reviewer configured', /approvals_reviewer/.test(config), 'Configure an approvals reviewer subagent', '~/.codex/config.toml'),
+    check('Sandbox mode set', /^\s*sandbox_mode\s*=/m.test(config), 'Set sandbox_mode (workspace-write recommended)', '~/.codex/config.toml',
+      undefined, 'paste into ~/.codex/config.toml:\nsandbox_mode = "workspace-write"'),
+    check('Approvals not disabled', !/^\s*approval_policy\s*=\s*"never"/m.test(config), 'approval_policy = "never" removes the human gate; prefer "on-request"', '~/.codex/config.toml',
+      undefined, 'paste into ~/.codex/config.toml:\napproval_policy = "on-request"'),
+    check('Reviewer configured', /approvals_reviewer/.test(config), 'Configure an approvals reviewer subagent', '~/.codex/config.toml',
+      undefined, 'paste into ~/.codex/config.toml:\napprovals_reviewer = "guardian_subagent"'),
   ];
 
   cats['Memory'] = [
-    check('Memories enabled', /^\s*memories\s*=\s*true/m.test(config) || /use_memories\s*=\s*true/.test(config), 'Enable [features] memories in config.toml', '~/.codex/config.toml'),
+    check('Memories enabled', /^\s*memories\s*=\s*true/m.test(config) || /use_memories\s*=\s*true/.test(config), 'Enable [features] memories in config.toml', '~/.codex/config.toml',
+      undefined, 'paste into ~/.codex/config.toml:\n[memories]\ngenerate_memories = true\nuse_memories = true'),
   ];
 
   const profiles = (config.match(/^\[profiles\./gm) || []).length;
   cats['Model Routing'] = [
-    check('Routing profiles defined (>=2)', profiles >= 2, 'Add [profiles.*] per model tier for one-flag switching', '~/.codex/config.toml', `${profiles} profiles`),
-    check('Routing documented in AGENTS.md', /routing|judgment/i.test(agentsMd), 'Document the judgment-depth rule in AGENTS.md', '~/.codex/AGENTS.md'),
+    check('Routing profiles defined (>=2)', profiles >= 2, 'Add [profiles.*] per model tier for one-flag switching', '~/.codex/config.toml', `${profiles} profiles`,
+      'paste into ~/.codex/config.toml:\n[profiles.deep]\nmodel = "<frontier model>"\nmodel_reasoning_effort = "xhigh"\n\n[profiles.daily]\nmodel = "<default model>"\nmodel_reasoning_effort = "high"\n\n[profiles.cheap]\nmodel = "<fast model>"\nmodel_reasoning_effort = "medium"'),
+    check('Routing documented in AGENTS.md', /routing|judgment/i.test(agentsMd), 'Document the judgment-depth rule in AGENTS.md', '~/.codex/AGENTS.md',
+      undefined, 'paste into ~/.codex/AGENTS.md:\n# Model Routing\nJudgment-depth rule: frontier tier for architecture/money/trust, default tier for production code, cheap tier for mechanical edits.'),
   ];
 
   const effort = (config.match(/^\s*model_reasoning_effort\s*=\s*"(\w+)"/m) || [])[1];
   cats['Cost & Context'] = [
-    check('Default effort not max/ultra', effort !== 'max' && effort !== 'ultra', 'Reserve max/ultra for escalation, not the session default', '~/.codex/config.toml', effort),
-    check('Output-discipline prompt hook', hooks.some(h => h.event === 'UserPromptSubmit' && /discipline|output/i.test(h.command)), 'Inject response-shape rules on UserPromptSubmit', '~/.codex/hooks.json'),
+    check('Default effort not max/ultra', effort !== 'max' && effort !== 'ultra', 'Reserve max/ultra for escalation, not the session default', '~/.codex/config.toml', effort,
+      'paste into ~/.codex/config.toml:\nmodel_reasoning_effort = "high"'),
+    check('Output-discipline prompt hook', hooks.some(h => h.event === 'UserPromptSubmit' && /discipline|output/i.test(h.command)), 'Inject response-shape rules on UserPromptSubmit', '~/.codex/hooks.json',
+      undefined, 'Create a UserPromptSubmit hook script that prints {"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"Lead with the answer. No preambles, no trailing recaps."}} and wire it in hooks.json.'),
   ];
 
   cats['Evals'] = [
-    check('Audit tooling installed', exists(path.join(CODEX, 'skills', 'harness-radar')) || exists(path.join(CLAUDE, 'skills', 'harness-radar')), 'Install harness-radar as a skill so audits are one command', '~/.codex/skills/harness-radar'),
+    check('Audit tooling installed', exists(path.join(CODEX, 'skills', 'harness-radar')) || exists(path.join(CLAUDE, 'skills', 'harness-radar')), 'Install harness-radar as a skill so audits are one command', '~/.codex/skills/harness-radar',
+      undefined, '$ npx skills add sants2001/harness-radar'),
   ];
 
   return cats;
@@ -243,22 +289,28 @@ function auditGeneric(def) {
   const short = p => p ? p.replace(HOME, '~') : (def.instructions || ['<instructions>'])[0];
 
   cats['Instructions'] = [
-    check('Always-loaded instructions present', !!instrPath, 'Create an instructions file (AGENTS.md is the cross-tool standard)', short(instrPath)),
-    check('Instruction budget sane (<64KB)', instrBytes > 0 && instrBytes < 65536, 'Split detail into read-on-demand files; keep the always-loaded file lean', short(instrPath), `${(instrBytes / 1024).toFixed(1)}KB`),
-    check('Read-on-demand split referenced', /read on demand|read when|refs\/|docs\//i.test(instrText), 'Point instructions at split reference files instead of inlining everything', short(instrPath)),
+    check('Always-loaded instructions present', !!instrPath, 'Create an instructions file (AGENTS.md is the cross-tool standard)', short(instrPath),
+      undefined, `paste into ${short(instrPath) || path.join(def.home, 'AGENTS.md').replace(HOME, '~')}:\n# Working rules\n- Lead with the answer; no preambles or recaps.\n- Verify before finishing: run build/tests, do not declare done on reasoning alone.\n- Never invent a function, file, or fact; "I do not know" is a valid answer.`),
+    check('Instruction budget sane (<64KB)', instrBytes > 0 && instrBytes < 65536, 'Split detail into read-on-demand files; keep the always-loaded file lean', short(instrPath), `${(instrBytes / 1024).toFixed(1)}KB`,
+      'Move each long section into a docs/ or refs/ file, then replace it with one line: "Read <file> when <situation>".'),
+    check('Read-on-demand split referenced', /read on demand|read when|refs\/|docs\//i.test(instrText), 'Point instructions at split reference files instead of inlining everything', short(instrPath),
+      undefined, 'paste into your instructions file:\n## Reference files (read on demand)\n| File | Read when |\n|---|---|\n| <refs-file> | <situation> |'),
   ];
 
   const configPath = (def.configs || ['config.toml', 'config.yaml', 'config.json', 'settings.json'])
     .map(p => resolveIn(def.home, p)).find(exists);
   cats['Config'] = [
-    check('Config present', !!configPath, 'No config file found; harness is running on defaults', short(configPath) || short(path.join(def.home, 'config.*'))),
+    check('Config present', !!configPath, 'No config file found; harness is running on defaults', short(configPath) || short(path.join(def.home, 'config.*')),
+      undefined, 'Create the harness config file and pin at least: default model, a sandbox/approval policy, and any hook or extension wiring your tool supports.'),
   ];
 
   const extDir = (def.extDirs || []).map(d => resolveIn(def.home, d)).find(exists);
   const ext = extDir ? auditSkillsDir(extDir) : { count: 0, broken: [] };
   cats['Extensions'] = [
-    check('Skills/commands/extensions installed', ext.count > 0, `Add reusable skills or commands under ${short(extDir) || def.extDirs.join('/')}`, short(extDir), `${ext.count} entries`),
-    check('No broken symlinks', ext.broken.length === 0, `Remove or repoint: ${ext.broken.slice(0, 3).join(', ')}`, short(extDir), `${ext.broken.length} broken`),
+    check('Skills/commands/extensions installed', ext.count > 0, `Add reusable skills or commands under ${short(extDir) || def.extDirs.join('/')}`, short(extDir), `${ext.count} entries`,
+      'Package repeated workflows as skills: a directory with a SKILL.md (name + one-line description + steps). Start with your 3 most repeated tasks.'),
+    check('No broken symlinks', ext.broken.length === 0, `Remove or repoint: ${ext.broken.slice(0, 3).join(', ')}`, short(extDir), `${ext.broken.length} broken`,
+      `$ find ${short(extDir) || '<ext-dir>'} -maxdepth 1 -type l ! -exec test -e {} \\; -print -delete`),
   ];
 
   return cats;
@@ -301,12 +353,15 @@ function renderText(results) {
       out.push('│' + ` ${mark} ${r.name.padEnd(16)} ${bar(r.score, r.max)}  ${String(r.score).padStart(2)}/10`.padEnd(W) + '│');
     }
     out.push('└' + '─'.repeat(W) + '┘');
-    const fails = rows.flatMap(r => r.checks.filter(c => !c.pass).map(c => ({ cat: r.name, ...c })));
+    const fails = rows.flatMap(r => r.checks.filter(c => !c.pass).map(c => ({ cat: r.name, ...c })))
+      .sort((a, b) => prio(a.cat) - prio(b.cat));
     if (fails.length) {
-      out.push('  fixes:');
+      out.push('  fix plan (highest impact first):');
       fails.forEach((f, i) => {
         out.push(`  ${i + 1}. [${f.cat}] ${f.name}${f.detail ? ` (${f.detail})` : ''}`);
-        out.push(`     → ${f.fix}   ${f.file}`);
+        out.push(`     why: ${f.fix}`);
+        out.push(`     file: ${f.file}`);
+        if (f.how) f.how.split('\n').forEach((l, j) => out.push(`     ${j === 0 ? 'how: ' : '      '}${l}`));
       });
     } else {
       out.push('  clean. nothing to fix.');
@@ -321,8 +376,13 @@ function renderMd(results) {
     out.push(`## ${target} — ${overall}/${max} (grade ${gradeOf(overall, max)})`, '');
     out.push('| Category | Score | Bar |', '|---|---|---|');
     rows.forEach(r => out.push(`| ${r.name} | ${r.score}/10 | \`${bar(r.score, r.max)}\` |`));
-    const fails = rows.flatMap(r => r.checks.filter(c => !c.pass).map(c => `- **[${r.name}]** ${c.name}: ${c.fix} (\`${c.file}\`)`));
-    if (fails.length) out.push('', '### Fixes', ...fails);
+    const fails = rows.flatMap(r => r.checks.filter(c => !c.pass).map(c => ({ cat: r.name, ...c })))
+      .sort((a, b) => prio(a.cat) - prio(b.cat))
+      .flatMap(c => [
+        `- **[${c.cat}]** ${c.name}: ${c.fix} (\`${c.file}\`)`,
+        ...(c.how ? ['', '  ```', ...c.how.split('\n').map(l => `  ${l}`), '  ```'] : []),
+      ]);
+    if (fails.length) out.push('', '### Fix plan (highest impact first)', ...fails);
     out.push('');
   }
   return out.join('\n');

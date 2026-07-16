@@ -1,6 +1,6 @@
 # harness-radar
 
-Deterministic audit for any AI agent harness. One zero-dependency Node script scores your setup from explicit file checks and prints an ASCII scorecard with exact fixes. Same config, same score, every time. No LLM judgment, no token burn.
+Deterministic audit for any AI agent harness. One zero-dependency Node script scores your setup from explicit file checks and prints an ASCII scorecard with a prioritized fix plan. Every failing check ships a copy-paste remediation recipe (a shell command or an exact config snippet), so the weakest model tier, or a human with no context, can apply the fixes verbatim and re-run for proof. Same config, same score, every time. No LLM judgment, no token burn.
 
 ```
 ╔═══════════════════════════════════════════════════════════╗
@@ -17,9 +17,11 @@ Deterministic audit for any AI agent harness. One zero-dependency Node script sc
 │ ✓ Cost & Context   ██████████  10/10                      │
 │ ✓ Evals            ██████████  10/10                      │
 └───────────────────────────────────────────────────────────┘
-  fixes:
+  fix plan (highest impact first):
   1. [Hooks] Slow hooks are async
-     → Mark hooks with timeout >=15s as "async": true   ~/.claude/settings.json
+     why: one hanging hook stalls every matching turn
+     file: ~/.claude/settings.json
+     how: Add "async": true to every hook object whose timeout is 15 or higher.
 ```
 
 ## Why
@@ -71,7 +73,8 @@ Every failing check ships with the exact file path and a one-line fix. The desig
 - **Deterministic or absent.** If a quality can't be checked by a file assertion, it isn't scored. No vibes.
 - **Zero dependencies.** One file, stdlib only, runs anywhere Node 18+ runs.
 - **Token-frugal by construction.** An agent invoking this skill makes one Bash call and relays the output. The audit itself costs zero LLM tokens.
-- **Fixes over findings.** Every failure names the file and the change.
+- **Fixes over findings.** Every failure carries a `how` recipe: a `$ command` to run or a snippet with its target file. The fix plan is priority-sorted (security first) and applyable verbatim.
+- **Weakest-agent proof.** The bundled SKILL.md is a literal protocol (run, relay, apply `how` fields, re-run). A Haiku-tier model produces the same audit and the same fixes as a frontier one, because the script did the thinking at authoring time.
 
 ## License
 
